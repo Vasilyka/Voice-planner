@@ -22,3 +22,8 @@ secrets.json
 # Настройки системы
 .DS_Store
 Thumbs.db
+# Результаты локальных тестов
+.build/
+recordings/
+tasks.db
+tasks.db-*
