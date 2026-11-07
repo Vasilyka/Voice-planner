@@ -1,0 +1,24 @@
+# PlatformIO (ESP32)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python (backend)
+__pycache__/
+*.pyc
+.venv/
+
+# Секреты и ключи
+.env
+.env.*
+!.env.example
+secrets.h
+secrets.json
+
+# Временные файлы
+*.tmp
+*.log
+
+# Настройки системы
+.DS_Store
+Thumbs.db
