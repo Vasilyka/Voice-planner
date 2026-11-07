@@ -5,6 +5,7 @@
 #include <esp_heap_caps.h>
 #include "audio_format.h"
 #include "board_pins.h"
+#include "status_display.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -29,6 +30,12 @@ bool rawPressed = false, stablePressed = false;
 uint32_t rawChangedAt = 0, lastAudioAt = 0, lastWifiRetry = 0;
 int previousWifiStatus = -1, peak = 0;
 size_t clippedSamples = 0;
+
+ScreenState screenState = ScreenState::Connecting;
+void updateScreen(ScreenState state, const char* detail) {
+  screenState = state;
+  showStatus(state, detail, wavBuffer ? pcmCapacity / (SAMPLE_RATE * 2) : 0);
+}
 
 void setLed(bool on) {
   if (LED_PIN >= 0) digitalWrite(LED_PIN, on ? HIGH : LOW);
@@ -108,11 +115,13 @@ void beginRecording() {
   recording = true;
   lastAudioAt = millis();
   setLed(true);
+  updateScreen(ScreenState::Recording, "SPEAK NOW");
   Serial.println("Запись. Говори и удерживай кнопку; отпусти для отправки.");
 }
 
 void sendRecording() {
   if (!pendingAudio) return;
+  updateScreen(ScreenState::Sending, "PLEASE WAIT");
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Ожидаю Wi-Fi до 8 секунд...");
     WiFi.reconnect();
@@ -120,6 +129,7 @@ void sendRecording() {
     while (WiFi.status() != WL_CONNECTED && millis() - started < 8000) delay(50);
   }
   if (WiFi.status() != WL_CONNECTED) {
+    updateScreen(ScreenState::Error, "NO WIFI");
     Serial.println("Нет Wi-Fi. Запись сохранена в RAM: отправь r в Serial для повтора.");
     return;
   }
@@ -129,6 +139,7 @@ void sendRecording() {
   http.setConnectTimeout(5000);
   http.setTimeout(15000);
   if (!http.begin(client, serverUrl)) {
+    updateScreen(ScreenState::Error, "SERVER URL");
     Serial.println("Не удалось открыть адрес сервера. Запись сохранена в RAM.");
     return;
   }
@@ -148,6 +159,8 @@ void sendRecording() {
   } else {
     Serial.println("Ошибка отправки: " + http.errorToString(code));
   }
+  updateScreen(pendingAudio ? ScreenState::Error : ScreenState::Saved,
+               pendingAudio ? "UPLOAD FAILED" : "SERVER RECEIVED");
   http.end();
   setLed(false);
   if (pendingAudio) Serial.println("Запись осталась в RAM. r — повтор; новое нажатие — новая запись.");
@@ -160,12 +173,14 @@ void finishRecording(bool sendAudio) {
   Serial.printf("Записано %.2f с, пик: %d/32768, отсчётов с клиппингом: %u\n",
                 pcmBytes / (SAMPLE_RATE * 2.0), peak, static_cast<unsigned>(clippedSamples));
   if (pcmBytes < SAMPLE_RATE * 2 / 5) {
+    updateScreen(ScreenState::Ready, "TOO SHORT");
     Serial.println("Запись короче 0.2 с — пропущена.");
     return;
   }
   pendingAudio = true;
   if (peak == 0) Serial.println("В записи нули: проверь питание, SD и L/R микрофона.");
   if (sendAudio) sendRecording();
+  else updateScreen(ScreenState::Error, "I2S READ");
   // Во время HTTP новые нажатия не записываются. Сначала нужна отпущенная кнопка.
 }
 
@@ -197,6 +212,7 @@ void readMicrophone() {
     Serial.printf("Ошибка чтения I2S: %s\n", esp_err_to_name(error));
     if (recording) finishRecording(false);
     ready = false;
+    updateScreen(ScreenState::Error, "I2S READ");
     return;
   }
   if (!recording) return;  // Вне записи кадры только выбрасываем.
@@ -211,6 +227,7 @@ void readMicrophone() {
   for (size_t i = 0; i < frames; ++i) {
     if (pcmBytes + 2 > pcmCapacity) {
       bufferFull = true;
+      updateScreen(ScreenState::BufferFull, "RELEASE BUTTON");
       setLed(false);
       Serial.println("Достигнут лимит памяти. Запись остановлена; отпусти кнопку для отправки.");
       break;
@@ -230,6 +247,11 @@ void pollWifi() {
   digitalWrite(WIFI_LED_PIN, status == WL_CONNECTED ? HIGH : LOW);
   if (status != previousWifiStatus) {
     previousWifiStatus = status;
+    if (ready && (screenState == ScreenState::Connecting || screenState == ScreenState::Ready ||
+                  screenState == ScreenState::Saved)) {
+      updateScreen(status == WL_CONNECTED ? ScreenState::Ready : ScreenState::Connecting,
+                   status == WL_CONNECTED ? "WIFI CONNECTED" : "WAIT FOR WIFI");
+    }
     if (status == WL_CONNECTED) {
       Serial.print("Wi-Fi подключён. IP ESP32: ");
       Serial.println(WiFi.localIP());
@@ -267,8 +289,10 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   Serial.println("Voice-planner: INMP441 -> WAV -> HTTP");
-  Serial.println("Display reserved; controller held in reset.");
+  if (!beginStatusDisplay()) Serial.println("DISPLAY ERROR: task allocation failed.");
   ready = setupMicrophone() && allocateAudio();
+  updateScreen(ready ? ScreenState::Connecting : ScreenState::Error,
+               ready ? "WAIT FOR WIFI" : "MIC OR MEMORY");
   rawPressed = digitalRead(BUTTON_PIN) == LOW;
   rawChangedAt = millis();
   Serial.println(ready ? "Готово. Отпусти кнопку, затем зажми для записи." : "Запись недоступна: смотри ошибку выше.");
