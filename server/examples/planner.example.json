@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "timezone": "Europe/Moscow",
+  "tasks": [
+    {
+      "id": "example-1",
+      "title": "Сделать лабораторную по физике",
+      "due_date": "2026-11-11",
+      "due_time": "18:00",
+      "priority": "normal",
+      "needs_clarification": false,
+      "note": "",
+      "status": "pending",
+      "number": 1
+    },
+    {
+      "id": "example-2",
+      "title": "Позвонить преподавателю",
+      "due_date": "2026-11-12",
+      "due_time": "10:30",
+      "priority": "high",
+      "needs_clarification": false,
+      "note": "",
+      "status": "pending",
+      "number": 2
+    },
+    {
+      "id": "example-3",
+      "title": "Купить хлеб и молоко",
+      "due_date": null,
+      "due_time": null,
+      "priority": "normal",
+      "needs_clarification": false,
+      "note": "",
+      "status": "pending",
+      "number": 3
+    },
+    {
+      "id": "example-4",
+      "title": "Подготовить презентацию проекта",
+      "due_date": null,
+      "due_time": null,
+      "priority": "normal",
+      "needs_clarification": true,
+      "note": "Уточнить, какой понедельник имелся в виду",
+      "status": "pending",
+      "number": 4
+    }
+  ],
+  "archived_tasks": [],
+  "clarifications": []
+}

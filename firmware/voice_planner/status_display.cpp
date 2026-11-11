@@ -4,26 +4,53 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include "board_pins.h"
 #include "status_display.h"
 
 namespace {
 constexpr int WIDTH = 184;
 constexpr int HEIGHT = 384;
+constexpr bool ROTATE_180 = true;
 constexpr bool MIRROR_X = true;
 constexpr bool MIRROR_Y = false;
 constexpr size_t BUFFER_SIZE = WIDTH * HEIGHT / 8;
 constexpr uint32_t BUSY_TIMEOUT_MS = 30000;
 const SPISettings EPD_SPI(4000000, MSBFIRST, SPI_MODE0);
 uint8_t image[BUFFER_SIZE];
+uint8_t previousImage[BUFFER_SIZE];
+uint8_t tableImage[BUFFER_SIZE];
+SemaphoreHandle_t tableMutex = nullptr;
+constexpr uint32_t PARTIAL_GAP_MS = 300;
+constexpr unsigned MAX_PARTIAL_UPDATES = 5;
 uint32_t lastRefreshEnd = 0;
 
 struct StatusFrame {
   ScreenState state;
   char detail[24];
   uint32_t limitSeconds;
+  uint32_t completedRecordings;
 };
 QueueHandle_t statusQueue = nullptr;
+// Изменяется только из основного цикла, вместе с отправкой StatusFrame.
+uint32_t completedRecordings = 0;
+
+bool isRecordingState(ScreenState state) {
+  return state == ScreenState::Recording || state == ScreenState::BufferFull;
+}
+
+enum class RefreshMode { Skip, Partial, Full };
+
+RefreshMode chooseRefresh(const StatusFrame& status, bool initialized,
+                          uint32_t lastFullRecording, unsigned partialUpdates) {
+  if (!initialized)
+    return isRecordingState(status.state) ? RefreshMode::Skip : RefreshMode::Full;
+  if (status.completedRecordings != lastFullRecording &&
+      !isRecordingState(status.state) && status.state != ScreenState::Sending && status.state != ScreenState::Processing)
+    return RefreshMode::Full;
+  // Лимит из примера Good Display: следующая очистка — после записи.
+  return partialUpdates < MAX_PARTIAL_UPDATES ? RefreshMode::Partial : RefreshMode::Skip;
+}
 
 // Шрифт 5 x 7. Каждый байт - столбец, младший бит - верхний пиксель.
 const char FONT_CHARS[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:-.";
@@ -109,25 +136,30 @@ bool initDisplay() {
   return waitReady("initialization");
 }
 
-void writeFrame(uint8_t ramCommand, bool useImage) {
+void writeFrame(uint8_t ramCommand, const uint8_t* pixels) {
   command(ramCommand);
   SPI.beginTransaction(EPD_SPI);
   digitalWrite(EPD_DC, HIGH);
   digitalWrite(EPD_CS, LOW);
   for (size_t i = 0; i < BUFFER_SIZE; ++i) {
-    SPI.transfer(useImage ? image[i] : 0x00);
+    SPI.transfer(pixels ? pixels[i] : 0x00);
   }
   digitalWrite(EPD_CS, HIGH);
   SPI.endTransaction();
 }
 
-bool refreshDisplay() {
+bool refreshDisplay(bool full) {
   const uint32_t started = millis();
-  Serial.println("EPD: initialize and send frame");
+  Serial.println(full ? "EPD: FULL refresh" : "EPD: PARTIAL refresh");
   if (!initDisplay()) return false;
-  writeFrame(0x24, true);
-  writeFrame(0x26, false); // Второй RAM plane = 0x00, как у Good Display.
-  command(0x22); dataByte(0xF4); // Полное обновление из примера панели.
+  if (!full) {
+    command(0x3C); dataByte(0x84); // Border: partial mode из примера Good Display.
+    command(0x21); dataByte(0x00); dataByte(0x40);
+  }
+  writeFrame(0x24, image);
+  // После deep sleep восстанавливаем старый кадр для дифференциального обновления.
+  writeFrame(0x26, full ? nullptr : previousImage);
+  command(0x22); dataByte(full ? 0xF4 : 0xFF);
   command(0x20);
 
   // BUSY должен подняться. Иначе обрыв BUSY/SPI может выглядеть как успех.
@@ -140,7 +172,7 @@ bool refreshDisplay() {
     delay(1);
   }
   Serial.println("EPD: BUSY HIGH - refreshing");
-  if (!waitReady("full refresh")) return false;
+  if (!waitReady(full ? "full refresh" : "partial refresh")) return false;
   Serial.println("EPD: BUSY LOW - controller ready");
 
   command(0x10); dataByte(0x01); // Deep sleep дисплея, ESP32 продолжает опрос кнопки.
@@ -153,6 +185,10 @@ bool refreshDisplay() {
 
 void pixel(int x, int y, bool black = true) {
   if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return;
+  if (ROTATE_180) {
+    x = WIDTH - 1 - x;
+    y = HEIGHT - 1 - y;
+  }
   if (MIRROR_X) x = WIDTH - 1 - x;
   if (MIRROR_Y) y = HEIGHT - 1 - y;
   const size_t index = y * (WIDTH / 8) + x / 8;
@@ -194,9 +230,18 @@ void centeredText(int y, const char *text, int scale = 1) {
 void drawStatus(const StatusFrame& status) {
   static const char* const titles[] = {
     "CONNECTING", "READY", "RECORDING", "BUFFER FULL",
-    "SENDING", "SAVED", "ERROR"
+    "SENDING", "SAVED", "ERROR", "PROCESSING", "TASKS"
   };
   memset(image, 0xFF, sizeof(image));
+  if (status.state == ScreenState::Tasks) {
+    xSemaphoreTake(tableMutex, portMAX_DELAY);
+    for (int y = 0; y < HEIGHT; ++y)
+      for (int x = 0; x < WIDTH; ++x)
+        if (!(tableImage[y * (WIDTH / 8) + x / 8] & (0x80 >> (x & 7))))
+          pixel(x, y);
+    xSemaphoreGive(tableMutex);
+    return;
+  }
   frame(0, 0, WIDTH, HEIGHT);
   centeredText(22, "VOICE", 3);
   centeredText(52, "PLANNER", 3);
@@ -221,23 +266,37 @@ void drawStatus(const StatusFrame& status) {
 void displayTask(void*) {
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   StatusFrame status;
-  bool first = true;
+  bool initialized = false;
+  unsigned partialUpdates = 0;
+  uint32_t lastFullRecording = 0;
   while (true) {
     xQueueReceive(statusQueue, &status, portMAX_DELAY);
-    if (!first) {
+    if (initialized) {
       const uint32_t elapsed = millis() - lastRefreshEnd;
-      if (elapsed < 2000) vTaskDelay(pdMS_TO_TICKS(2000 - elapsed));
+      if (elapsed < PARTIAL_GAP_MS)
+        vTaskDelay(pdMS_TO_TICKS(PARTIAL_GAP_MS - elapsed));
     }
-    // Во время полного обновления промежуточные состояния заменяются последним.
     while (xQueueReceive(statusQueue, &status, 0) == pdTRUE) {}
+    const RefreshMode mode = chooseRefresh(status, initialized, lastFullRecording, partialUpdates);
+    if (mode == RefreshMode::Skip) continue;
     drawStatus(status);
-    if (!refreshDisplay()) {
+    if (mode == RefreshMode::Partial && memcmp(image, previousImage, BUFFER_SIZE) == 0)
+      continue;
+    const bool full = mode == RefreshMode::Full;
+    if (!refreshDisplay(full)) {
       digitalWrite(EPD_CS, HIGH);
       digitalWrite(EPD_RST, LOW);
       Serial.println("DISPLAY ERROR: disabled until reboot; audio remains available.");
       vTaskDelete(nullptr);
     }
-    first = false;
+    memcpy(previousImage, image, BUFFER_SIZE);
+    initialized = true;
+    if (full) {
+      partialUpdates = 0;
+      lastFullRecording = status.completedRecordings;
+    } else {
+      ++partialUpdates;
+    }
   }
 }
 }  // namespace
@@ -247,10 +306,13 @@ bool beginStatusDisplay() {
   digitalWrite(EPD_RST, LOW); pinMode(EPD_RST, OUTPUT);
   digitalWrite(EPD_DC, LOW); pinMode(EPD_DC, OUTPUT);
   pinMode(EPD_BUSY, INPUT);
+  tableMutex = xSemaphoreCreateMutex();
+  if (!tableMutex) return false;
   statusQueue = xQueueCreate(1, sizeof(StatusFrame));
-  if (statusQueue == nullptr) return false;
+  if (statusQueue == nullptr) { vSemaphoreDelete(tableMutex); return false; }
   if (xTaskCreatePinnedToCore(displayTask, "epaper", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
     vQueueDelete(statusQueue);
+    vSemaphoreDelete(tableMutex);
     statusQueue = nullptr;
     return false;
   }
@@ -262,6 +324,19 @@ void showStatus(ScreenState state, const char* detail, uint32_t limitSeconds) {
   StatusFrame frame = {};
   frame.state = state;
   frame.limitSeconds = limitSeconds;
+  frame.completedRecordings = completedRecordings;
   snprintf(frame.detail, sizeof(frame.detail), "%s", detail);
   xQueueOverwrite(statusQueue, &frame);
+}
+
+void notifyRecordingFinished() {
+  ++completedRecordings;
+}
+
+void showTaskTable(const uint8_t* pixels, uint32_t limitSeconds) {
+  if (!statusQueue) return;
+  xSemaphoreTake(tableMutex, portMAX_DELAY);
+  memcpy(tableImage, pixels, BUFFER_SIZE);
+  xSemaphoreGive(tableMutex);
+  showStatus(ScreenState::Tasks, "", limitSeconds);
 }

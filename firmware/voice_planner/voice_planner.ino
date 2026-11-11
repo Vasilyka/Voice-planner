@@ -6,6 +6,9 @@
 #include "audio_format.h"
 #include "board_pins.h"
 #include "status_display.h"
+#include "planner_client.h"
+#include "planner_protocol.h"
+#include <cJSON.h>
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -31,6 +34,10 @@ uint32_t rawChangedAt = 0, lastAudioAt = 0, lastWifiRetry = 0;
 int previousWifiStatus = -1, peak = 0;
 size_t clippedSamples = 0;
 
+String activePlannerJob;
+String recordingId;
+PlannerEvent plannerEvent;
+bool plannerAvailable = false;
 ScreenState screenState = ScreenState::Connecting;
 void updateScreen(ScreenState state, const char* detail) {
   screenState = state;
@@ -107,6 +114,8 @@ void beginRecording() {
     i2s_channel_read(microphone, inputFrames, sizeof(inputFrames), &discarded, 0);
     if (discarded == 0) break;
   }
+  recordingId = String(static_cast<uint32_t>(ESP.getEfuseMac()), HEX) + "-" +
+                String(esp_random(), HEX) + "-" + String(millis());
   pcmBytes = 0;
   peak = 0;
   clippedSamples = 0;
@@ -144,23 +153,48 @@ void sendRecording() {
     return;
   }
   http.addHeader("Content-Type", "audio/wav");
+  http.addHeader("X-Recording-Id", recordingId);
   setLed(true);
   Serial.printf("Отправка WAV: %u байт -> %s\n", static_cast<unsigned>(pcmBytes + WAV_HEADER_BYTES), serverUrl);
   const int code = http.POST(wavBuffer, pcmBytes + WAV_HEADER_BYTES);
   Serial.printf("HTTP: %d\n", code);
+  bool queued = false, cloudMissing = false;
+  const char* failureDetail = "UPLOAD FAILED";
   if (code > 0) {
-    Serial.println("Ответ: " + http.getString());
+    const String response = http.getString();
+    Serial.println("Ответ: " + response);
     if (code >= 200 && code < 300) {
-      pendingAudio = false;
-      Serial.println("Сервер принял запись.");
+      cJSON* root = cJSON_Parse(response.c_str());
+      cJSON* status = root ? cJSON_GetObjectItemCaseSensitive(root, "status") : nullptr;
+      cJSON* job = root ? cJSON_GetObjectItemCaseSensitive(root, "job_id") : nullptr;
+      cJSON* state = root ? cJSON_GetObjectItemCaseSensitive(root, "processing") : nullptr;
+      if (cJSON_IsString(status) && cJSON_IsString(job) && cJSON_IsString(state) &&
+          validPlannerAck(status->valuestring, job->valuestring, state->valuestring)) {
+        cloudMissing = plannerJobState(state->valuestring) == PlannerJobState::NeedsConfiguration;
+        queued = plannerAvailable && trackPlannerJob(job->valuestring);
+        if (queued) {
+          activePlannerJob = job->valuestring;
+          pendingAudio = false;
+          Serial.println("Сервер принял запись.");
+        } else {
+          failureDetail = "PLANNER UNAVAILABLE";
+          Serial.println("Запись принята сервером, но отслеживание не запущено. Повтори r.");
+        }
+      } else {
+        failureDetail = "BAD SERVER ACK";
+        Serial.println("Неверное подтверждение сервера. WAV остаётся в RAM для повтора.");
+      }
+      cJSON_Delete(root);
     } else {
       Serial.println("Сервер не принял запись. Проверь обработчик /voice.");
     }
   } else {
     Serial.println("Ошибка отправки: " + http.errorToString(code));
   }
-  updateScreen(pendingAudio ? ScreenState::Error : ScreenState::Saved,
-               pendingAudio ? "UPLOAD FAILED" : "SERVER RECEIVED");
+  if (pendingAudio) updateScreen(ScreenState::Error, failureDetail);
+  else if (cloudMissing) updateScreen(ScreenState::Error, "CLOUD NOT SET");
+  else if (queued) updateScreen(ScreenState::Processing, "RECOGNIZING");
+  else updateScreen(ScreenState::Error, "PLANNER UNAVAILABLE");
   http.end();
   setLed(false);
   if (pendingAudio) Serial.println("Запись осталась в RAM. r — повтор; новое нажатие — новая запись.");
@@ -168,6 +202,7 @@ void sendRecording() {
 
 void finishRecording(bool sendAudio) {
   recording = false;
+  notifyRecordingFinished();
   waitForRelease = true;
   setLed(false);
   Serial.printf("Записано %.2f с, пик: %d/32768, отсчётов с клиппингом: %u\n",
@@ -290,6 +325,7 @@ void setup() {
   WiFi.begin(ssid, password);
   Serial.println("Voice-planner: INMP441 -> WAV -> HTTP");
   if (!beginStatusDisplay()) Serial.println("DISPLAY ERROR: task allocation failed.");
+  plannerAvailable = beginPlannerClient(serverUrl);
   ready = setupMicrophone() && allocateAudio();
   updateScreen(ready ? ScreenState::Connecting : ScreenState::Error,
                ready ? "WAIT FOR WIFI" : "MIC OR MEMORY");
@@ -298,12 +334,34 @@ void setup() {
   Serial.println(ready ? "Готово. Отпусти кнопку, затем зажми для записи." : "Запись недоступна: смотри ошибку выше.");
 }
 
+void handlePlannerEvents() {
+  if (!ready || recording || pendingAudio) return;
+  if (!receivePlannerEvent(plannerEvent)) return;
+  const bool idleTableAllowed = screenState == ScreenState::Ready || screenState == ScreenState::Tasks ||
+                                screenState == ScreenState::Connecting || screenState == ScreenState::Saved;
+  if (!acceptPlannerEvent(activePlannerJob.c_str(), plannerEvent, idleTableAllowed)) return;
+  if (plannerEvent.kind == PlannerEventKind::Table) {
+    showTaskTable(plannerEvent.pixels, pcmCapacity / (SAMPLE_RATE * 2));
+    screenState = ScreenState::Tasks;
+    if (plannerEvent.jobId[0]) {
+      acknowledgePlannerJob(plannerEvent.jobId);
+      activePlannerJob = "";
+    }
+  } else if (plannerEvent.kind == PlannerEventKind::Processing) {
+    updateScreen(ScreenState::Processing, plannerEvent.detail);
+  } else {
+    updateScreen(ScreenState::Error, plannerEvent.detail);
+  }
+}
+
 void loop() {
   pollButton();
   if (ready) readMicrophone();
   pollWifi();
+  handlePlannerEvents();
   while (Serial.available()) {
     const char command = Serial.read();
+    if ((command == 'n' || command == 'N') && !recording) nextPlannerPage();
     if ((command == 'r' || command == 'R') && !recording) {
       sendRecording();
       waitForRelease = true;

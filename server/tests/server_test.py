@@ -22,15 +22,18 @@ class ServerTest(unittest.TestCase):
     def setUpClass(cls):
         cls.folder = ROOT / ".build" / ("server-test-" + uuid.uuid4().hex)
         cls.folder.mkdir(parents=True)
-        shutil.copyfile(ROOT / "main.py", cls.folder / "main.py")
+        for source in ROOT.glob("*.py"):
+            shutil.copyfile(source, cls.folder / source.name)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         cls.url = f"http://127.0.0.1:{port}"
         cls.log = (cls.folder / "server.log").open("w", encoding="utf-8")
+        import os
+        environment = dict(os.environ, YANDEX_API_KEY="", YANDEX_FOLDER_ID="")
         cls.process = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
-            cwd=cls.folder, stdout=cls.log, stderr=subprocess.STDOUT,
+            cwd=cls.folder, stdout=cls.log, stderr=subprocess.STDOUT, env=environment,
         )
         for _ in range(300):
             try:
@@ -52,8 +55,11 @@ class ServerTest(unittest.TestCase):
         cls.process.wait(timeout=5)
         cls.log.close()
 
-    def post(self, body, content_type="audio/wav"):
-        request = Request(self.url + "/voice", data=body, headers={"Content-Type": content_type})
+    def post(self, body, content_type="audio/wav", recording_id=None):
+        headers = {"Content-Type": content_type}
+        if recording_id:
+            headers["X-Recording-Id"] = recording_id
+        request = Request(self.url + "/voice", data=body, headers=headers)
         try:
             with urlopen(request, timeout=5) as response:
                 return response.status, json.load(response)
@@ -104,6 +110,42 @@ class ServerTest(unittest.TestCase):
             tasks = json.load(response)["tasks"]
         self.assertEqual(tasks[0]["task"], data["task"])
         self.assertEqual(self.post(b"[]", "application/json")[0], 400)
+
+
+    def test_idempotent_upload_and_conflict(self):
+        body = self.wav()
+        before = set((self.folder / "recordings").glob("*.wav"))
+        status, first = self.post(body, recording_id="device-retry-test")
+        self.assertEqual(status, 200)
+        status, second = self.post(body, recording_id="device-retry-test")
+        self.assertEqual(status, 200)
+        self.assertEqual(first["job_id"], second["job_id"])
+        self.assertEqual(first["file"], second["file"])
+        self.assertEqual(len(set((self.folder / "recordings").glob("*.wav")) - before), 1)
+        changed = body[:-2] + bytes([1, 0])
+        self.assertEqual(self.post(changed, recording_id="device-retry-test")[0], 409)
+
+    def test_job_state_and_bitmap_without_cloud_key(self):
+        with urlopen(self.url + "/health") as response:
+            health = json.load(response)
+        self.assertTrue(health["worker_running"])
+        status, result = self.post(self.wav())
+        self.assertEqual(status, 200)
+        with urlopen(self.url + "/jobs/" + result["job_id"] + "?compact=true") as response:
+            job = json.load(response)
+        self.assertEqual(job["state"], "needs_configuration")
+        self.assertNotIn("transcript", job)
+        with urlopen(self.url + "/planner.json") as response:
+            snapshot = json.load(response)
+        self.assertEqual(snapshot["schema_version"], 2)
+        self.assertEqual(snapshot["tasks"], [])
+        with urlopen(self.url + "/display/frame.bin?page=0") as response:
+            self.assertEqual(len(response.read()), 8832)
+            self.assertEqual(response.headers["X-Pages"], "1")
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self.url + "/jobs/nonexistent")
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
 
 
 if __name__ == "__main__":

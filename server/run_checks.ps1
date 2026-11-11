@@ -10,6 +10,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Ошибка проверки PCM/WAV.' }
     & $pythonCommand tests/server_test.py
     if ($LASTEXITCODE -ne 0) { throw 'Ошибка HTTP-тестов.' }
+    & $pythonCommand tests/planner_test.py
+    if ($LASTEXITCODE -ne 0) { throw 'Ошибка проверки облачной цепочки.' }
+    & $pythonCommand tests/task_actions_test.py
+    if ($LASTEXITCODE -ne 0) { throw 'Ошибка проверки команд задач.' }
 } finally {
     Pop-Location
 }

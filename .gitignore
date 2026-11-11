@@ -27,3 +27,6 @@ Thumbs.db
 recordings/
 tasks.db
 tasks.db-*
+
+# Экспорт таблицы и локальные данные планировщика
+/server/data/
