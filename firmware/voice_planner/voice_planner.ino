@@ -351,6 +351,7 @@ void handlePlannerEvents() {
     updateScreen(ScreenState::Processing, plannerEvent.detail);
   } else {
     updateScreen(ScreenState::Error, plannerEvent.detail);
+    if (plannerEvent.kind == PlannerEventKind::JobFailed) activePlannerJob = "";
   }
 }
 

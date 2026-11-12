@@ -85,7 +85,8 @@ void pollJob() {
     if (!getFrame(true)) sendStatus(PlannerEventKind::Error, "TABLE OFFLINE");
   } else if (state == PlannerJobState::Failed || state == PlannerJobState::NeedsConfiguration) {
     Serial.println("Planner: " + String(field(json, "error")));
-    sendStatus(PlannerEventKind::Error, state == PlannerJobState::Failed ? "CLOUD FAILED" : "CLOUD NOT SET");
+    sendStatus(PlannerEventKind::JobFailed, state == PlannerJobState::Failed ? "CLOUD FAILED" : "CLOUD NOT SET");
+    jobId[0] = 0;
   }
   if (state == PlannerJobState::Queued || state == PlannerJobState::Processing)
     sendStatus(PlannerEventKind::Processing, "RECOGNIZING");

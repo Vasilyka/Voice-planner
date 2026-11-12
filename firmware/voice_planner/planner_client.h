@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 constexpr unsigned PLANNER_FRAME_BYTES = 184 * 384 / 8;
-enum class PlannerEventKind { Table, Processing, Error };
+enum class PlannerEventKind { Table, Processing, Error, JobFailed };
 struct PlannerEvent {
   PlannerEventKind kind;
   char jobId[33];
